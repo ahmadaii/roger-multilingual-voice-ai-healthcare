@@ -284,17 +284,19 @@ Total latency: ~100–150ms from first speech frame to agent silence.
 
 ## Multilanguage Support
 
-| Language | STT (Whisper) | STT (Deepgram) | TTS (OpenAI) | TTS (Deepgram) |
-|----------|:---:|:---:|:---:|:---:|
-| English | ✅ | ✅ | ✅ | ✅ |
-| Spanish | ✅ | ✅ | ✅ | ✅ |
-| Haitian Creole | ✅ | ❌ → Whisper | ✅ | ❌ → OpenAI |
-| Portuguese | ✅ | ✅ | ✅ | ❌ → OpenAI |
-| Persian | ✅ | ✅ | ✅ | ❌ → OpenAI |
-| Arabic | ✅ | ✅ | ✅ | ❌ → OpenAI |
-| French | ✅ | ✅ | ✅ | ❌ → OpenAI |
+Roger serves **7 languages** across the full call stack — STT, LLM reasoning, TTS, and all spoken scripts. Provider selection and fallback are resolved at runtime from locale configuration in `config/locales/`; the agent and audio pipeline require no per-language changes.
 
-Provider selection and fallback are resolved at runtime from locale configuration. LLM responses are always generated in the target language via system prompt injection, regardless of locale script availability.
+| Language | Script | STT | TTS | Notes |
+|----------|--------|-----|-----|-------|
+| English | Latin | Primary provider | Primary provider | Full support across all providers |
+| Spanish | Latin | Primary provider | Primary provider | Full support across all providers |
+| Portuguese | Latin | Primary provider | Primary provider | TTS falls back to secondary provider |
+| French | Latin | Primary provider | Primary provider | TTS falls back to secondary provider |
+| Arabic | Arabic | Primary provider | Primary provider | TTS falls back to secondary provider |
+| Persian | Persian | Primary provider | Primary provider | TTS falls back to secondary provider |
+| Haitian Creole | Latin | Falls back to secondary provider | Primary provider | STT falls back; TTS falls back |
+
+Language is detected from the inbound call's dialer config and injected into the LLM system prompt — LLM responses are always generated in the caller's language regardless of script or provider coverage. Where a primary STT or TTS provider lacks coverage for a given locale, `AudioService` transparently falls back to the next provider in the chain with no interruption to the call.
 
 ---
 
@@ -385,7 +387,7 @@ self.logger.error(f"Error in {self.name}: {str(e)}")
 
 ## Infrastructure & Deployment
 
-> 📐 _Diagram placeholder — AWS deployment topology_
+![Infrastructure Diagram](images/diagrams/infra.png)
 
 Roger runs as a **multi-AZ containerized workload on AWS**:
 
