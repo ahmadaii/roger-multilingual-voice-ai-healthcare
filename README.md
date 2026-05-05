@@ -37,39 +37,9 @@ Millions of eligible Americans never enroll in SNAP, Medicaid, and WIC — not b
 
 ## System Architecture
 
-> 📐 _Diagram placeholder — system architecture_
+![System Architecture](images/diagrams/architecture.png)
 
-```
-Inbound Call (Twilio)
-        │
-        ▼
-┌──────────────────────────────────────────────────┐
-│              FastRTC Audio Engine                 │
-│  µ-law 8kHz ──► PCM decode ──► VAD / Barge-in    │
-│  InterruptibleReplyOnPause  ──► TwiML clear flush │
-└───────────────────┬──────────────────────────────┘
-                    │ audio chunks
-                    ▼
-┌──────────────────────────────────────────────────┐
-│                 AudioService                      │
-│  STT: Whisper-1  /  Deepgram Nova-2 (fallback)   │
-│  TTS: OpenAI TTS-1  /  Deepgram Aura (fallback)  │
-└───────────────────┬──────────────────────────────┘
-                    │ transcript
-                    ▼
-┌──────────────────────────────────────────────────┐
-│           MultipurposeBot (LangGraph)             │
-│  ┌────────────────────────────────────────────┐  │
-│  │        ProgramApplicationAgent             │  │
-│  │  greeting → language → programs → Q&A      │  │
-│  │  → OTP → application Qs → consent → submit │  │
-│  └────────────────────────────────────────────┘  │
-└───────────────────┬──────────────────────────────┘
-                    │ typed API calls
-                    ▼
-         ThriveLink REST API
-  (auth · dialer config · questions · submit)
-```
+
 
 ---
 
@@ -261,23 +231,45 @@ stt_model = get_stt_model("faster-whisper")  # or "whisper-groq" / "moonshine"
 
 ## Speech Pipeline
 
-### STT — Multi-provider with automatic fallback
+All STT and TTS providers implement the same `STTModel` / `TTSModel` ABC (`core/stt/base.py`, `core/tts/base.py`). The active provider is resolved at startup via `get_stt_model()` / `get_tts_model()` — **no agent code changes** when switching between cloud APIs and self-hosted GPU pods.
 
-| Provider | When used | Notes |
-|----------|-----------|-------|
-| **Deepgram Nova-2** | Primary (if configured) | Live WebSocket for barge-in detection; batch for transcription |
-| **OpenAI Whisper-1** | Default / fallback | All 7 languages; used when Deepgram doesn't support the detected language |
+### STT
+
+| Provider | Mode | When used |
+|----------|------|-----------|
+| **OpenAI Whisper-1** | Batch (REST) | Default; all 7 languages |
+| **Deepgram Nova-2** | Batch + live WebSocket | Optional primary; live stream used for barge-in detection |
+| **Faster Whisper** _(RunPod)_ | Batch (OpenAI-compatible) | Self-hosted GPU pod; full data residency, no third-party STT dependency |
 
 Confidence gating: `>80%` → accept · `60–80%` → request DTMF confirm · `<60%` → re-prompt or ask caller to spell.
 
-### TTS — Streaming PCM, provider-swappable
+```python
+# core/stt/utils.py — factory: swap provider via env var, zero agent changes
+def get_stt_model(provider: str) -> STTModel:
+    if provider == "whisper":   return WhisperSTT()       # OpenAI Whisper-1
+    if provider == "deepgram":  return DeepgramSTT()      # Nova-2
+    if provider == "runpod":    return FasterWhisperSTT() # self-hosted GPU pod
+```
 
-| Provider | Format | Notes |
-|----------|--------|-------|
-| **OpenAI TTS-1** | 16-bit PCM 24kHz | Primary; sentence-buffered streaming |
+### TTS
+
+| Provider | Format | When used |
+|----------|--------|-----------|
+| **OpenAI TTS-1** | 16-bit PCM 24kHz | Default primary; sentence-buffered streaming |
 | **Deepgram Aura** | 16-bit PCM 24kHz | Fallback; auto-activates on OpenAI quota errors |
+| **Orpheus 3B** _(RunPod)_ | 16-bit PCM 24kHz | Self-hosted GPU pod; ultra-natural voice, LLM token → SNAC decoder pipeline |
+| **Kokoro** _(local)_ | 16-bit PCM 24kHz | FastRTC-native; development / low-resource environments |
 
-Text is pre-processed before synthesis: markdown stripped, ellipses normalized, LLM artifacts cleaned. A 150ms silence pad is appended between sentences to prevent audio stitching artifacts over Twilio's µ-law re-encoding.
+Text is pre-processed before synthesis: markdown stripped, ellipses normalised, LLM artefacts cleaned. A 150ms silence pad is appended between sentences to prevent audio-stitching artefacts over Twilio's µ-law re-encoding.
+
+```python
+# core/tts/utils.py — same factory pattern
+def get_tts_model(provider: str) -> TTSModel:
+    if provider == "openai":         return OpenAITTSModel()
+    if provider == "deepgram":        return DeepgramTTSModel()
+    if provider == "orpheus-runpod":  return OrpheusTTSModel()  # streams LLM tokens → SNAC → PCM
+    if provider == "kokoro":          return KokoroTTSModel()   # FastRTC-native local
+```
 
 ### Barge-in — Sub-200ms interrupt
 
@@ -314,6 +306,80 @@ Voice data accuracy is a harder problem than transcription accuracy. Roger uses 
 2. **LLM structured output** — every field is extracted via Pydantic schema, not regex. The LLM validates type, format, and cross-field coherence (e.g. age vs DOB).
 3. **Repeat-back confirmation** — every PII field is spoken back digit-by-digit before being accepted.
 4. **Retry escalation** — 3 consecutive failures on any field routes to human care team, with full context transferred.
+
+---
+
+## Observability & Tracing
+
+Every layer of a phone call — STT confidence, LLM reasoning, tool calls, TTS latency, provider fallbacks — is instrumented. Observability is not bolted on: it is threaded through `BaseAgent` itself.
+
+### LangSmith — LangGraph execution tracing
+
+`LANGSMITH_TRACING` is a first-class setting in `config/settings.py`. When enabled, every `ainvoke()` and `astream()` call emits a full LangGraph trace to LangSmith: each node, its input/output state delta, execution time, and any exceptions.
+
+```python
+# config/settings.py
+LANGSMITH_API_KEY:  Optional[str]  # set via env
+LANGSMITH_TRACING: bool = False    # flip to True in staging/prod
+LANGSMITH_PROJECT: str  = "roger-enrollment"
+```
+
+```python
+# core/base_agent.py — tracing opt-in baked into the base class
+self.tracing_enabled = (
+    enable_tracing if enable_tracing is not None
+    else settings.LANGSMITH_TRACING
+)
+```
+
+Every enrollment call is traceable as a single LangSmith run, with child spans per agent node — making it straightforward to answer: *"At which node did this call fail?"* or *"How long did the OTP verification node take on average?"*
+
+### Opik — LLM evaluation and prompt versioning
+
+Opik is configured at startup via `observability/opik_utils.py` and used for two purposes:
+
+**1. End-to-end call tracing** — LLM inputs, outputs, token counts, and latency are logged per call. Combined with LangSmith node traces, this gives full visibility from transcript → LLM decision → API call → spoken response.
+
+**2. Prompt versioning** — every system prompt used in production is versioned through Opik's `Prompt` registry via `observability/prompt_versioning.py`:
+
+```python
+# observability/prompt_versioning.py
+class Prompt:
+    def __init__(self, name: str, prompt: str):
+        self.__prompt = opik.Prompt(name=name, prompt=prompt)  # versioned in Opik
+    
+    @property
+    def prompt(self) -> str:
+        return self.__prompt.prompt  # always serves the latest approved version
+```
+
+Avatar system prompts (`avatar.version_system_prompt()`) and agent prompts are both versioned this way — a prompt change is a versioned event in Opik, not a silent code commit.
+
+### Structured logging
+
+Every agent has its own named logger (`agent.<name>`) configured in `BaseAgent._setup_logger()`. Log lines carry agent name, invocation inputs, success/error outcome, and timing — structured JSON in production (CloudWatch), human-readable in development.
+
+```python
+# core/base_agent.py
+self.logger = logging.getLogger(f"agent.{self.name}")
+# Every node call emits:
+self.logger.info(f"Async invoking {self.name} with inputs: {inputs}")
+self.logger.error(f"Error in {self.name}: {str(e)}")
+```
+
+`MCPClient` has its own logger at `core.mcp_client` — every API call, token refresh, and transfer event is logged with full context (stage, retry count, reason).
+
+### What gets traced per call
+
+| Signal | Tool | Retention |
+|--------|------|-----------|
+| LangGraph node execution (state in/out, timing) | LangSmith | 30 days |
+| LLM inputs / outputs / token usage | Opik | 90 days |
+| Prompt versions in production | Opik registry | Indefinite |
+| STT confidence, provider used, fallback events | Structured logs → CloudWatch | 90 days |
+| TTS provider, latency, fallback events | Structured logs → CloudWatch | 90 days |
+| API call outcomes, token refresh events, transfer triggers | MCPClient logs → CloudWatch | 90 days |
+| Long-term audit archive | S3 + lifecycle | Configurable |
 
 ---
 
